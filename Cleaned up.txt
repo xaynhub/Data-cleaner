@@ -1,1 +1,353 @@
-https://replit.com/@mzayn3908/AnomalyDetect?s=app
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+import hashlib
+import logging
+from typing import Dict, List, Any
+import json
+import warnings
+
+warnings.filterwarnings('ignore')
+
+
+class DataPurifier:
+    """
+    AI-powered data purification system that detects and repairs data leakage,
+    contamination, and quality issues to ensure AI-ready datasets.
+    """
+
+    def __init__(self, config: Dict[str, Any] = None):
+        self.config = config or self._default_config()
+        self.scaler = StandardScaler()
+        self.anomaly_detector = IsolationForest(
+            contamination=self.config['anomaly_threshold'],
+            random_state=42
+        )
+        self.logger = self._setup_logger()
+        self.data_fingerprints = {}
+        self.validation_results = {}
+
+    def _default_config(self) -> Dict[str, Any]:
+        """Default configuration for the purifier"""
+        return {
+            'anomaly_threshold': 0.1,
+            'duplicate_threshold': 0.95,
+            'temporal_window_hours': 24,
+            'min_data_quality_score': 0.8,
+            'max_missing_ratio': 0.3,
+            'statistical_drift_threshold': 0.05
+        }
+
+    def _setup_logger(self) -> logging.Logger:
+        """Setup logging for the purifier"""
+        logger = logging.getLogger('DataPurifier')
+        logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        if not logger.handlers:
+            logger.addHandler(handler)
+        return logger
+
+    def purify_dataset(self, df: pd.DataFrame, target_column: str = None) -> Dict[str, Any]:
+        """
+        Main purification pipeline that processes a dataset through all checks
+        """
+        self.logger.info(f"Starting purification of dataset with {len(df)} rows, {len(df.columns)} columns")
+
+        results = {
+            'original_shape': df.shape,
+            'issues_found': [],
+            'repairs_made': [],
+            'quality_score': 0.0,
+            'purified_data': df.copy()
+        }
+
+        # Step 1: Detect and repair temporal leakage
+        if target_column:
+            leakage_results = self.detect_temporal_leakage(df, target_column)
+            results['issues_found'].extend(leakage_results['issues'])
+            if leakage_results['leaked_features']:
+                results['purified_data'] = self.repair_temporal_leakage(
+                    results['purified_data'], leakage_results['leaked_features']
+                )
+                results['repairs_made'].append(f"Removed {len(leakage_results['leaked_features'])} leaked features")
+
+        # Step 2: Detect and remove duplicates
+        duplicate_results = self.detect_duplicates(results['purified_data'])
+        if duplicate_results['duplicate_indices']:
+            results['purified_data'] = results['purified_data'].drop(duplicate_results['duplicate_indices'])
+            results['repairs_made'].append(f"Removed {len(duplicate_results['duplicate_indices'])} duplicates")
+
+        # Step 3: Detect and handle anomalies
+        anomaly_results = self.detect_anomalies(results['purified_data'])
+        results['issues_found'].extend(anomaly_results['issues'])
+        if anomaly_results['anomaly_indices']:
+            results['purified_data'] = self.handle_anomalies(
+                results['purified_data'], anomaly_results['anomaly_indices']
+            )
+            results['repairs_made'].append(f"Handled {len(anomaly_results['anomaly_indices'])} anomalies")
+
+        # Step 4: Detect data poisoning patterns
+        poisoning_results = self.detect_poisoning(results['purified_data'])
+        results['issues_found'].extend(poisoning_results['issues'])
+
+        # Step 5: Quality assessment and validation
+        quality_results = self.assess_data_quality(results['purified_data'])
+        results['quality_score'] = quality_results['overall_score']
+        results['quality_breakdown'] = quality_results['breakdown']
+
+        # Step 6: Generate data fingerprint
+        results['data_fingerprint'] = self.generate_fingerprint(results['purified_data'])
+
+        self.logger.info(f"Purification complete. Quality score: {results['quality_score']:.3f}")
+        return results
+
+    def detect_temporal_leakage(self, df: pd.DataFrame, target_column: str) -> Dict[str, Any]:
+        results = {
+            'issues': [],
+            'leaked_features': []
+        }
+        if target_column not in df.columns:
+            return results
+
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        correlations = df[numeric_cols].corr()[target_column].abs()
+
+        suspicious_features = correlations[
+            (correlations > 0.99) & (correlations.index != target_column)
+        ].index.tolist()
+
+        if suspicious_features:
+            results['issues'].append(f"Found {len(suspicious_features)} features with suspicious correlations")
+            results['leaked_features'].extend(suspicious_features)
+
+        for col in numeric_cols:
+            if col != target_column:
+                if np.allclose(df[col].fillna(0), df[target_column].fillna(0), rtol=1e-10):
+                    results['issues'].append(f"Feature {col} has identical distribution to target")
+                    results['leaked_features'].append(col)
+
+        return results
+
+    def repair_temporal_leakage(self, df: pd.DataFrame, leaked_features: List[str]) -> pd.DataFrame:
+        df_repaired = df.copy()
+        for feature in leaked_features:
+            if feature in df_repaired.columns:
+                df_repaired = df_repaired.drop(columns=[feature])
+        return df_repaired
+
+    def detect_duplicates(self, df: pd.DataFrame) -> Dict[str, Any]:
+        results = {
+            'duplicate_indices': [],
+            'near_duplicate_pairs': []
+        }
+        exact_duplicates = df.duplicated(keep='first')
+        results['duplicate_indices'] = df[exact_duplicates].index.tolist()
+
+        if len(df) < 10000:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                feature_hashes = []
+                for idx, row in df[numeric_cols].iterrows():
+                    normalized = (row.fillna(0) / (row.std() + 1e-8)).round(2)
+                    hash_val = hashlib.md5(str(normalized.values).encode()).hexdigest()
+                    feature_hashes.append((idx, hash_val))
+
+                hash_groups = {}
+                for idx, hash_val in feature_hashes:
+                    hash_groups.setdefault(hash_val, []).append(idx)
+
+                for indices in hash_groups.values():
+                    if len(indices) > 1:
+                        results['near_duplicate_pairs'].append(indices)
+
+        return results
+
+    def detect_anomalies(self, df: pd.DataFrame) -> Dict[str, Any]:
+        results = {
+            'issues': [],
+            'anomaly_indices': []
+        }
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) == 0:
+            return results
+
+        data_for_analysis = df[numeric_cols].fillna(df[numeric_cols].median())
+
+        if len(data_for_analysis) > 2:
+            data_scaled = self.scaler.fit_transform(data_for_analysis)
+            anomaly_labels = self.anomaly_detector.fit_predict(data_scaled)
+            anomaly_indices = df.index[anomaly_labels == -1].tolist()
+
+            if anomaly_indices:
+                results['issues'].append(f"Found {len(anomaly_indices)} statistical anomalies")
+                results['anomaly_indices'] = anomaly_indices
+
+        return results
+
+    def handle_anomalies(self, df: pd.DataFrame, anomaly_indices: List[int]) -> pd.DataFrame:
+        df_handled = df.copy()
+        numeric_cols = df_handled.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            Q1 = df_handled[col].quantile(0.25)
+            Q3 = df_handled[col].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
+            for idx in anomaly_indices:
+                if idx in df_handled.index:
+                    if df_handled.loc[idx, col] < lower_bound:
+                        df_handled.loc[idx, col] = lower_bound
+                    elif df_handled.loc[idx, col] > upper_bound:
+                        df_handled.loc[idx, col] = upper_bound
+        return df_handled
+
+    def detect_poisoning(self, df: pd.DataFrame) -> Dict[str, Any]:
+        results = {'issues': []}
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            value_counts = df[col].value_counts()
+            most_common_freq = value_counts.iloc[0] if len(value_counts) > 0 else 0
+            if most_common_freq > len(df) * 0.5:
+                results['issues'].append(f"Column {col} has {most_common_freq} identical values (potential poisoning)")
+
+        categorical_cols = df.select_dtypes(include=['object', 'category']).columns
+        for col in categorical_cols:
+            if len(df[col].unique()) > 1:
+                value_counts = df[col].value_counts(normalize=True)
+                if value_counts.iloc[0] > 0.95:
+                    results['issues'].append(f"Column {col} shows extreme categorical bias")
+        return results
+
+    def assess_data_quality(self, df: pd.DataFrame) -> Dict[str, Any]:
+        quality_metrics = {}
+        completeness = 1 - (df.isnull().sum().sum() / (len(df) * len(df.columns)))
+        quality_metrics['completeness'] = completeness
+
+        consistency_score = 1.0
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                sample_values = df[col].dropna().head(100)
+                if len(sample_values) > 0:
+                    type_diversity = len(set(type(val).__name__ for val in sample_values))
+                    if type_diversity > 2:
+                        consistency_score -= 0.1
+        quality_metrics['consistency'] = max(0, consistency_score)
+
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            uniqueness_scores = []
+            for col in numeric_cols:
+                unique_ratio = len(df[col].unique()) / len(df)
+                uniqueness_scores.append(min(unique_ratio, 1.0))
+            quality_metrics['uniqueness'] = np.mean(uniqueness_scores)
+        else:
+            quality_metrics['uniqueness'] = 1.0
+
+        validity_score = 1.0
+        for col in numeric_cols:
+            inf_count = np.isinf(df[col]).sum()
+            if inf_count > 0:
+                validity_score -= (inf_count / len(df)) * 0.5
+        quality_metrics['validity'] = max(0, validity_score)
+
+        weights = {'completeness': 0.3, 'consistency': 0.3, 'uniqueness': 0.2, 'validity': 0.2}
+        overall_score = sum(quality_metrics[metric] * weight for metric, weight in weights.items())
+
+        return {'overall_score': overall_score, 'breakdown': quality_metrics}
+
+    def generate_fingerprint(self, df: pd.DataFrame) -> str:
+        fingerprint_data = {
+            'shape': df.shape,
+            'columns': sorted(df.columns.tolist()),
+            'dtypes': {col: str(dtype) for col, dtype in df.dtypes.items()},
+            'sample_stats': {}
+        }
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols[:5]:
+            fingerprint_data['sample_stats'][col] = {
+                'mean': float(df[col].mean()) if not df[col].isna().all() else None,
+                'std': float(df[col].std()) if not df[col].isna().all() else None
+            }
+        fingerprint_string = json.dumps(fingerprint_data, sort_keys=True)
+        return hashlib.sha256(fingerprint_string.encode()).hexdigest()
+
+    def validate_for_ai_readiness(self, df: pd.DataFrame) -> Dict[str, Any]:
+        validation_results = {
+            'is_ai_ready': False,
+            'issues': [],
+            'recommendations': []
+        }
+        if len(df) < 100:
+            validation_results['issues'].append("Dataset too small (< 100 rows)")
+            validation_results['recommendations'].append("Collect more data")
+
+        missing_ratio = df.isnull().sum().sum() / (len(df) * len(df.columns))
+        if missing_ratio > self.config['max_missing_ratio']:
+            validation_results['issues'].append(f"Too much missing data ({missing_ratio:.2%})")
+            validation_results['recommendations'].append("Implement missing data imputation")
+
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) < 2:
+            validation_results['issues'].append("Insufficient numeric features for AI training")
+            validation_results['recommendations'].append("Engineer more features or collect additional data")
+
+        validation_results['is_ai_ready'] = len(validation_results['issues']) == 0
+        return validation_results
+
+
+def demo_data_purifier():
+    print("=== AI Data Purifier Demo ===\n")
+
+    np.random.seed(42)
+    n_samples = 1000
+    data = {
+        'feature_1': np.random.normal(10, 2, n_samples),
+        'feature_2': np.random.exponential(2, n_samples),
+        'feature_3': np.random.uniform(0, 100, n_samples),
+        'target': np.random.binomial(1, 0.3, n_samples)
+    }
+    df = pd.DataFrame(data)
+    df.loc[len(df)] = df.iloc[0]
+    df.loc[len(df)] = df.iloc[1]
+
+    missing_indices = np.random.choice(df.index, size=50, replace=False)
+    df.loc[missing_indices, 'feature_2'] = np.nan
+
+    outlier_indices = np.random.choice(df.index, size=10, replace=False)
+    df.loc[outlier_indices, 'feature_1'] = df['feature_1'].mean() + 10 * df['feature_1'].std()
+
+    df['leaked_feature'] = df['target'] * 100 + np.random.normal(0, 0.01, len(df))
+
+    purifier = DataPurifier()
+    results = purifier.purify_dataset(df, target_column='target')
+
+    print("PURIFICATION RESULTS:")
+    print(f"Original shape: {results['original_shape']}")
+    print(f"Purified shape: {results['purified_data'].shape}")
+    print(f"Data quality score: {results['quality_score']:.3f}")
+
+    print("\nIssues found:")
+    for issue in results['issues_found']:
+        print(f"  - {issue}")
+
+    print("\nRepairs made:")
+    for repair in results['repairs_made']:
+        print(f"  - {repair}")
+
+    print(f"\nData fingerprint: {results['data_fingerprint'][:16]}...")
+
+    ai_validation = purifier.validate_for_ai_readiness(results['purified_data'])
+    print(f"\nAI Ready: {ai_validation['is_ai_ready']}")
+    if ai_validation['issues']:
+        print("Remaining issues:")
+        for issue in ai_validation['issues']:
+            print(f"  - {issue}")
+
+    return results
+
+
+if __name__ == "__main__":
+    demo_results = demo_data_purifier()
